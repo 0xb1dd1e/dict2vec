@@ -18,13 +18,22 @@
  * along with Dict2vec.  If not, see <http://www.gnu.org/licenses/>.
  */
 
+#ifndef __GCC__
+#define WINDOWS_PLATFORM
+#endif
+
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>      /* strcat */
 #include <math.h>
+#ifdef WINDOWS_PLATFORM
+#include <windows.h>
+#include <time.h>
+#else
 #include <pthread.h>
+#endif
 
 #define MAXLEN       100
 #define MAXLINE      1000
@@ -85,7 +94,7 @@ struct entry *vocab;
 struct parameters args = {
 	"", "",
 	100, 5, 5, 5, 0, 0, 1, 1, 0,
-	0.025, 0.025, 1e-4, 1.0, 0.25
+	0.025f, 0.025f, 1e-4f, 1.0f, 0.25f
 };
 
 /* variables required for processing input file */
@@ -409,7 +418,7 @@ int read_strong_pairs(char *filename)
 		return 1;
 	}
 
-	while ((fscanf(fi, "%s %s", word1, word2) != EOF))
+	while ((fscanf(fi, "%99s %99s", word1, word2) != EOF))
 	{
 		i1 = find(word1);
 		i2 = find(word2);
@@ -469,7 +478,7 @@ int read_weak_pairs(char *filename)
 		return 1;
 	}
 
-	while ((fscanf(fi, "%s %s", word1, word2) != EOF))
+	while ((fscanf(fi, "%99s %99s", word1, word2) != EOF))
 	{
 		i1 = find(word1);
 		i2 = find(word2);
@@ -535,7 +544,7 @@ void read_vocab(char *input_fn, char *strong_fn, char *weak_fn)
 
 	/* some words are longer than MAXLEN, need to indicate a maximum width
 	 * to scanf so no buffer overflow. */
-	while ((fscanf(fi, "%100s", word) != EOF))
+	while ((fscanf_s(fi, "%99s", word, (unsigned)_countof(word)) != EOF))
 	{
 		/* increment total number of read words */
 		train_words++;
@@ -618,7 +627,11 @@ void destroy_network()
 		free(WO);
 }
 
+#ifdef WINDOWS_PLATFORM
+DWORD WINAPI train_thread(void *id)
+#else
 void *train_thread(void *id)
+#endif
 {
 	FILE *fi;
 	char word[MAXLEN];
@@ -679,7 +692,7 @@ void *train_thread(void *id)
 		{
 			/* some words are longer than MAXLEN, need to indicate a
 			 * maximum width to scanf so no buffer overflow. */
-			fscanf(fi, "%100s", word);
+			fscanf(fi, "%99s", word);
 			w_t = vocab_hash[find(word)];
 
 			/* word is not in vocabulary, move to next one */
@@ -782,9 +795,14 @@ void *train_thread(void *id)
 					if (vocab[w_c].n_sp == 0)
 						break;
 
-					if (vocab[w_c].pos_sp > vocab[w_c].n_sp - 1)
-						vocab[w_c].pos_sp = 0;
-					target = vocab[w_c].sp[vocab[w_c].pos_sp++];
+#ifdef WINDOWS_PLATFORM
+					int cursor = InterlockedIncrement(&vocab[w_c].pos_sp);
+#else
+					int cursor = PTHREAD_INTERLOCKED_INC(&vocab[w_c].pos_sp)
+#endif
+					cursor = (cursor - 1) % vocab[w_c].n_sp;
+
+					target = vocab[w_c].sp[cursor];
 
 					index2 = target * args.dim;
 					dot_prod = 0;
@@ -814,11 +832,15 @@ void *train_thread(void *id)
 					if (vocab[w_c].n_wp == 0)
 						break;
 
-					if (vocab[w_c].pos_wp > vocab[w_c].n_wp - 1)
-						vocab[w_c].pos_wp = 0;
-					target = vocab[w_c].wp[vocab[w_c].pos_wp++];
+#ifdef WINDOWS_PLATFORM
+					int cursor = InterlockedIncrement(&vocab[w_c].pos_wp);
+#else
+					int cursor = PTHREAD_INTERLOCKED_INC(&vocab[w_c].pos_sp)
+#endif
+					cursor = (cursor - 1) % vocab[w_c].n_wp;
+					target = vocab[w_c].wp[cursor];
 
-					index2 = target * args.dim;
+					index2 = target * args.dim;   
 					dot_prod = 0;
 					for (k = 0; k < args.dim; ++k)
 						dot_prod += WI[index1 + k] * WO[index2 + k];
@@ -855,7 +877,10 @@ void *train_thread(void *id)
 
 	fclose(fi);
 	free(hidden);
+#ifndef WINDOWS_PLATFORM
 	pthread_exit(NULL);
+#endif
+	return 0;
 }
 
 /* save the word vectors in output file. If epoch > 0, add the suffix
@@ -1029,7 +1054,12 @@ int main(int argc, char **argv)
 {
 	char spairs_file[MAXLEN], wpairs_file[MAXLEN];
 	int i;
+#ifdef WINDOWS_PLATFORM
+	HANDLE  *threads;
+	DWORD   *threadIDs;
+#else
 	pthread_t *threads;
+#endif
 
 	/* no arguments given. Print help and exit */
 	if (argc == 1)
@@ -1055,11 +1085,18 @@ int main(int argc, char **argv)
 	/*********** train ***/
 	/* variable for future use */
 
-	if ((threads = calloc(args.num_threads, sizeof *threads)) == NULL)
+	if ((threads = calloc(args.num_threads, sizeof(*threads))) == NULL)
 	{
 		printf("Cannot allocate memory for threads\n");
 		exit(1);
 	}
+#ifdef WINDOWS_PLATFORM
+	if ((threadIDs = calloc(args.num_threads, sizeof(DWORD))) == NULL)
+	{
+		printf("Cannot allocate memory for thread ids\n");
+		exit(1);
+	}
+#endif
 
 	/* get words from input file */
 	printf("Starting training using file %s\n", args.input);
@@ -1074,19 +1111,41 @@ int main(int argc, char **argv)
 
 	/* train the model for multiple epoch */
 	start = clock();
+
 	for (current_epoch = 0; current_epoch < args.epoch; current_epoch++)
 	{
 		printf("\n-- Epoch %d/%d\n", current_epoch+1, args.epoch);
 
+#ifdef WINDOWS_PLATFORM
 		/* create threads */
 		for (i = 0; i < args.num_threads; i++)
-			pthread_create(&threads[i], NULL, train_thread,
-					(void *) (intptr_t) i);
+		{
+			threads[i] = CreateThread(
+				NULL,                   // default security attributes
+				0,                      // use default stack size  
+				train_thread,			// thread function name
+				(void*)(intptr_t)i,		// argument to thread function 
+				0,						// use default creation flags 
+				&threadIDs[i]);			// returns the thread identifier 
+			if (threads[i] == NULL)
+			{
+				printf("Cannot create threads\n");
+				exit(1);
+			}
+		}
 
+		WaitForMultipleObjects(args.num_threads, threads, TRUE, INFINITE);
+		for (int i = 0; i < args.num_threads; i++)
+		{
+			CloseHandle(threads[i]);
+		}
+#else
 		/* wait for threads to join. When they join, epoch is finished
 		 */
 		for (i = 0; i < args.num_threads; i++)
 			pthread_join(threads[i], NULL);
+#endif
+
 
 		if (args.save_each_epoch)
 		{
@@ -1106,6 +1165,9 @@ int main(int argc, char **argv)
 
 	free(table);
 	free(threads);
+#ifdef WINDOWS_PLATFORM
+	free(threadIDs);
+#endif
 	destroy_vocab();
 
 	/******** end train ****/
