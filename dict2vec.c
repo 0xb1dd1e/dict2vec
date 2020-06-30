@@ -18,9 +18,9 @@
  * along with Dict2vec.  If not, see <http://www.gnu.org/licenses/>.
  */
 
-#ifndef __GCC__
-#define WINDOWS_PLATFORM
-#endif
+
+// #define WINDOWS_PLATFORM
+
 
 #include <ctype.h>
 #include <stdio.h>
@@ -28,12 +28,9 @@
 #include <stdint.h>
 #include <string.h>      /* strcat */
 #include <math.h>
-#ifdef WINDOWS_PLATFORM
-#include <windows.h>
-#include <time.h>
-#else
-#include <pthread.h>
-#endif
+#include <threads.h>
+#include <stdatomic.h>
+#include <assert.h>
 
 #define MAXLEN       100
 #define MAXLINE      1000
@@ -52,12 +49,12 @@ struct entry
 	 * (faster because no need to compute a lot of random indexes).
 	 * Weak pairs follow the same implementation.
 	 */
-	int n_sp;       /* number of strong pairs of entry */
-	int pos_sp;     /* current cursor position in sp[] */
+	int n_sp;       	/* number of strong pairs of entry */
+	atomic_int pos_sp;	/* current cursor position in sp[] */
 	int *sp;
 
-	int n_wp;       /* number of weak pairs of entry */
-	int pos_wp;     /* current cursor position in wp[] */
+	int n_wp;       	/* number of weak pairs of entry */
+	atomic_int pos_wp;	/* current cursor position in wp[] */
 	int *wp;
 
 
@@ -176,6 +173,8 @@ static float sigmoid(const float x)
 	};
 
 	static int index;
+
+	assert(isfinite(x));
 
 	index = ((x / MAX_SIGMOID) + 1) / 2 * SIGMOID_SIZE;
 	return values[index];
@@ -544,7 +543,7 @@ void read_vocab(char *input_fn, char *strong_fn, char *weak_fn)
 
 	/* some words are longer than MAXLEN, need to indicate a maximum width
 	 * to scanf so no buffer overflow. */
-	while ((fscanf_s(fi, "%99s", word, (unsigned)_countof(word)) != EOF))
+	while ((fscanf(fi, "%99s", word) != EOF))
 	{
 		/* increment total number of read words */
 		train_words++;
@@ -627,11 +626,7 @@ void destroy_network()
 		free(WO);
 }
 
-#ifdef WINDOWS_PLATFORM
-DWORD WINAPI train_thread(void *id)
-#else
-void *train_thread(void *id)
-#endif
+int train_thread(void *id)
 {
 	FILE *fi;
 	char word[MAXLEN];
@@ -766,8 +761,14 @@ void *train_thread(void *id)
 					/* forward propagation */
 					index2 = target * args.dim;
 					dot_prod = 0.0;
-					for (k = 0; k < args.dim; ++k)
-						dot_prod += WI[index1 + k] * WO[index2 + k];
+					for (k = 0; k < args.dim; ++k) {
+						float updated = dot_prod + WI[index1 + k] * WO[index2 + k];
+						if (isfinite(updated)) {
+							dot_prod = updated;
+						} else {
+							// printf("1) avoid creating a NaN for dot_prod (%f)\n", dot_prod);
+						}
+					}
 
 					if (dot_prod > MAX_SIGMOID)
 						grad = args.alpha * (label - 1.0);
@@ -795,19 +796,21 @@ void *train_thread(void *id)
 					if (vocab[w_c].n_sp == 0)
 						break;
 
-#ifdef WINDOWS_PLATFORM
-					int cursor = InterlockedIncrement(&vocab[w_c].pos_sp);
-#else
-					int cursor = PTHREAD_INTERLOCKED_INC(&vocab[w_c].pos_sp)
-#endif
+					int cursor = ++vocab[w_c].pos_sp;
 					cursor = (cursor - 1) % vocab[w_c].n_sp;
 
 					target = vocab[w_c].sp[cursor];
 
 					index2 = target * args.dim;
 					dot_prod = 0;
-					for (k = 0; k < args.dim; ++k)
-						dot_prod += WI[index1 + k] * WO[index2 + k];
+					for (k = 0; k < args.dim; ++k) {
+						float updated = dot_prod + WI[index1 + k] * WO[index2 + k];
+						if (isfinite(updated)) {
+							dot_prod = updated;
+						} else {
+							// printf("2) avoid a NaN for dot_prod (%f)\n", dot_prod);
+						}
+					}
 
 					/* dot product is already high, nothing to do */
 					if (dot_prod > MAX_SIGMOID)
@@ -832,19 +835,20 @@ void *train_thread(void *id)
 					if (vocab[w_c].n_wp == 0)
 						break;
 
-#ifdef WINDOWS_PLATFORM
-					int cursor = InterlockedIncrement(&vocab[w_c].pos_wp);
-#else
-					int cursor = PTHREAD_INTERLOCKED_INC(&vocab[w_c].pos_sp)
-#endif
+					int cursor = ++vocab[w_c].pos_wp;
 					cursor = (cursor - 1) % vocab[w_c].n_wp;
 					target = vocab[w_c].wp[cursor];
 
 					index2 = target * args.dim;   
 					dot_prod = 0;
-					for (k = 0; k < args.dim; ++k)
-						dot_prod += WI[index1 + k] * WO[index2 + k];
-
+					for (k = 0; k < args.dim; ++k) {
+						float updated = dot_prod + WI[index1 + k] * WO[index2 + k];
+						if (isfinite(updated)) {
+							dot_prod = updated;
+						} else {
+							// printf("3) avoid a NaN for dot_prod (%f)\n", dot_prod);
+						}
+					}
 					if (dot_prod > MAX_SIGMOID)
 						continue;
 					else if (dot_prod < -MAX_SIGMOID)
@@ -877,9 +881,7 @@ void *train_thread(void *id)
 
 	fclose(fi);
 	free(hidden);
-#ifndef WINDOWS_PLATFORM
-	pthread_exit(NULL);
-#endif
+
 	return 0;
 }
 
@@ -888,7 +890,7 @@ void *train_thread(void *id)
 void save_vectors(char *output, int epoch)
 {
 	FILE *fo;
-	char suffix[15], copy[MAXLEN];
+	char suffix[22], copy[MAXLEN];
 	int i, j;
 
 	if (epoch > 0)
@@ -1054,12 +1056,7 @@ int main(int argc, char **argv)
 {
 	char spairs_file[MAXLEN], wpairs_file[MAXLEN];
 	int i;
-#ifdef WINDOWS_PLATFORM
-	HANDLE  *threads;
-	DWORD   *threadIDs;
-#else
-	pthread_t *threads;
-#endif
+	thrd_t *threads;
 
 	/* no arguments given. Print help and exit */
 	if (argc == 1)
@@ -1116,35 +1113,14 @@ int main(int argc, char **argv)
 	{
 		printf("\n-- Epoch %d/%d\n", current_epoch+1, args.epoch);
 
-#ifdef WINDOWS_PLATFORM
 		/* create threads */
 		for (i = 0; i < args.num_threads; i++)
-		{
-			threads[i] = CreateThread(
-				NULL,                   // default security attributes
-				0,                      // use default stack size  
-				train_thread,			// thread function name
-				(void*)(intptr_t)i,		// argument to thread function 
-				0,						// use default creation flags 
-				&threadIDs[i]);			// returns the thread identifier 
-			if (threads[i] == NULL)
-			{
-				printf("Cannot create threads\n");
-				exit(1);
-			}
-		}
+			thrd_create(&threads[i], train_thread, (void *)(intptr_t)i);
 
-		WaitForMultipleObjects(args.num_threads, threads, TRUE, INFINITE);
-		for (int i = 0; i < args.num_threads; i++)
-		{
-			CloseHandle(threads[i]);
-		}
-#else
 		/* wait for threads to join. When they join, epoch is finished
 		 */
 		for (i = 0; i < args.num_threads; i++)
-			pthread_join(threads[i], NULL);
-#endif
+			thrd_join(threads[i], NULL);
 
 
 		if (args.save_each_epoch)

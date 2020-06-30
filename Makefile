@@ -33,5 +33,8 @@ all: dict2vec
 dict2vec : dict2vec.c
 	$(CC) dict2vec.c -o ./dict2vec $(CFLAGS)
 
+debug : dict2vec.c
+	$(CC) dict2vec.c -o ./dict2vec_dbg $(CFLAGS) -O0 -g
+
 clean:
 	rm -rf dict2vec
