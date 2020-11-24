@@ -882,6 +882,10 @@ int train_thread(void *id)
 	fclose(fi);
 	free(hidden);
 
+#ifndef WINDOWS_PLATFORM
+	pthread_exit(NULL);
+#endif
+
 	return 0;
 }
 
